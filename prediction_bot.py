@@ -540,10 +540,38 @@ def _check_settlement(live_games):
                 active_bet["last_away_score"] = as_
                 break
         return
-    # Game ended - settle the bet
-    hs = active_bet["last_home_score"]
-    as_ = active_bet["last_away_score"]
-    _settle_bet(hs, as_)
+    # Game ended - try to fetch final score from API
+    final_h, final_a = active_bet["last_home_score"], active_bet["last_away_score"]
+    view = fetch_game_view(gid)
+    if view and isinstance(view, dict):
+        # Try to get final score from game view
+        scores = view.get("scores") or view.get("score")
+        if scores:
+            try:
+                if isinstance(scores, str):
+                    parts = scores.split("-")
+                    final_h, final_a = int(parts[0]), int(parts[1])
+                elif isinstance(scores, list) and len(scores) >= 2:
+                    final_h, final_a = int(scores[0]), int(scores[1])
+            except (ValueError, IndexError):
+                pass
+        # Also try home_score/away_score fields
+        if view.get("home_score") is not None and view.get("away_score") is not None:
+            try:
+                final_h = int(view["home_score"])
+                final_a = int(view["away_score"])
+            except (ValueError, TypeError):
+                pass
+        # Try from home/away score objects
+        home_data = view.get("home") or {}
+        away_data = view.get("away") or {}
+        if home_data.get("score") is not None:
+            try: final_h = int(home_data["score"])
+            except (ValueError, TypeError): pass
+        if away_data.get("score") is not None:
+            try: final_a = int(away_data["score"])
+            except (ValueError, TypeError): pass
+    _settle_bet(final_h, final_a)
 
 
 def _settle_bet(final_home, final_away):
