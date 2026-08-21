@@ -419,17 +419,23 @@ def scan_and_predict():
         return None, None, [], games
 
     results = []
+    debug_lines = []
     for g in eligible:
         try:
             odds = fetch_odds(g["id"])
             if not odds:
+                debug_lines.append(f"{g['id']}: odds=EMPTY")
                 continue
             preds, markets = analyze_game(g, odds)
+            n_markets = len(markets)
+            debug_lines.append(f"{g['id']}: markets={n_markets} preds={len(preds)}")
             for p in preds:
                 results.append((g, p))
                 pred_count += 1
         except Exception as e:
-            print(f'Error analyzing {g["id"]}: {e}')
+            debug_lines.append(f"{g['id']}: ERROR {e}")
+    # Store debug info for the worker
+    scan_and_predict.debug = debug_lines
 
     results.sort(key=lambda x: x[1]["confidence"], reverse=True)
     if results:
@@ -466,7 +472,18 @@ def auto_scan_worker():
                 known_games = current_ids
 
             # --- Send predictions ---
-            print(f'Cycle {cycle}: {len(games)} games, {len(all_results)} predictions')
+            dbg = getattr(scan_and_predict, 'debug', [])
+            if cycle <= 3 or not bg:
+                # First 3 cycles or any failure: send diagnostic to Telegram
+                diag = f"\U0001f50d Cycle {cycle}\n"
+                diag += f"Games: {len(games)} | Eligible: {len([g for g in games if get_quarter(g) >= 2])}\n"
+                diag += f"Predictions found: {len(all_results)}\n"
+                if dbg:
+                    diag += "\n" + "\n".join(dbg)
+                if all_results:
+                    diag += f"\n\nBest: {all_results[0][1]['type']} {all_results[0][1]['pick']} {all_results[0][1]['confidence']}%"
+                bot.send_message(CHAT_ID, diag, parse_mode="HTML")
+
             if bg and bp:
                 if ALL_PREDICTIONS and all_results:
                     for g, p in all_results:
@@ -477,7 +494,6 @@ def auto_scan_worker():
                             rank = 1 if (g, p) == (bg, bp) else 2
                             bot.send_message(CHAT_ID, fmt_pred(g, p, rank=rank), parse_mode="HTML")
                             last_predictions[key] = new_conf
-                            print(f'  Sent: {p["type"]} {p["pick"]} {p["confidence"]}%')
                 else:
                     key = f"{bg['id']}_{bp['type']}"
                     old = last_predictions.get(key, 0)
@@ -485,11 +501,6 @@ def auto_scan_worker():
                     if abs(new_conf - old) >= 5:
                         bot.send_message(CHAT_ID, fmt_pred(bg, bp, rank=1), parse_mode="HTML")
                         last_predictions[key] = new_conf
-                        print(f'  Sent: {bp["type"]} {bp["pick"]} {bp["confidence"]}%')
-                    else:
-                        print(f'  Dedup: {bp["type"]} {bp["confidence"]}% (old={old})')
-            else:
-                print(f'  No predictions this cycle')
 
             # Periodic status every 10 cycles (10 min)
             if cycle % 10 == 0 and games:
@@ -500,7 +511,7 @@ def auto_scan_worker():
                 )
 
         except Exception as e:
-            print(f'Scan cycle {cycle} error: {e}')
+            bot.send_message(CHAT_ID, f"\u274c Cycle {cycle} crashed: {e}", parse_mode="HTML")
 
         # Sleep in 1-second increments for instant stop capability
         for _ in range(SCAN_INTERVAL):
