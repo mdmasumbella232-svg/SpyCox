@@ -1,0 +1,7 @@
+🏀 Basketball Prediction Bot starting...
+   Chat ID: 7200809630
+   Scan interval: 60s
+   Confidence threshold: 60%
+   Auto-start: True
+   3G optimized: timeout=8s, workers=3
+   Auto-scan started (background)
