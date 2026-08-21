@@ -18,7 +18,7 @@ BASE_URL = "https://inforadar.live"
 SPORT_ID = 18
 SCAN_INTERVAL = 60
 AUTO_START = True  # fully automatic on launch, no commands needed
-NEW_GAME_ALERT = True  # notify when new games enter Q2
+NEW_GAME_ALERT = False  # notify when new games enter Q2
 ALL_PREDICTIONS = False  # True = send all picks, False = only #1 best
 CONFIDENCE_THRESHOLD = 60
 MAX_GAMES_IN_MEMORY = 20
