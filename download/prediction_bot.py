@@ -476,9 +476,9 @@ def auto_scan_worker():
                 known_games = current_ids
 
             # --- Send predictions ---
+            print(f'Cycle {cycle}: {len(games)} games, {len(all_results)} predictions')
             if bg and bp:
                 if ALL_PREDICTIONS and all_results:
-                    # Send ALL predictions, but dedup per game+type
                     for g, p in all_results:
                         key = f"{g['id']}_{p['type']}"
                         old = last_predictions.get(key, 0)
@@ -487,14 +487,19 @@ def auto_scan_worker():
                             rank = 1 if (g, p) == (bg, bp) else 2
                             bot.send_message(CHAT_ID, fmt_pred(g, p, rank=rank), parse_mode="HTML")
                             last_predictions[key] = new_conf
+                            print(f'  Sent: {p["type"]} {p["pick"]} {p["confidence"]}%')
                 else:
-                    # Send only the #1 best pick, dedup
                     key = f"{bg['id']}_{bp['type']}"
                     old = last_predictions.get(key, 0)
                     new_conf = bp["confidence"]
                     if abs(new_conf - old) >= 5:
                         bot.send_message(CHAT_ID, fmt_pred(bg, bp, rank=1), parse_mode="HTML")
                         last_predictions[key] = new_conf
+                        print(f'  Sent: {bp["type"]} {bp["pick"]} {bp["confidence"]}%')
+                    else:
+                        print(f'  Dedup: {bp["type"]} {bp["confidence"]}% (old={old})')
+            else:
+                print(f'  No predictions this cycle')
 
             # Periodic status every 10 cycles (10 min)
             if cycle % 10 == 0 and games:
@@ -505,7 +510,7 @@ def auto_scan_worker():
                 )
 
         except Exception as e:
-            pass
+            print(f'Scan cycle {cycle} error: {e}')
 
         # Sleep in 1-second increments for instant stop capability
         for _ in range(SCAN_INTERVAL):
@@ -684,10 +689,12 @@ if __name__ == "__main__":
     print(f"   Auto-start: {AUTO_START}")
     print(f"   3G optimized: timeout={REQUEST_TIMEOUT}s, workers={MAX_WORKERS}")
 
+    _VER = "v2.1"
+
     # Launch message
     mode = "\U0001f525 FULLY AUTOMATIC" if AUTO_START else "manual"
     bot.send_message(CHAT_ID,
-        f"\U0001f3c0 <b>Bot Online! {mode}</b>\n"
+        f"\U0001f3c0 <b>Bot Online! {_VER} {mode}</b>\n"
         f"Scanning every {SCAN_INTERVAL}s. Predictions auto-sent.\n"
         f"Confidence threshold: {CONFIDENCE_THRESHOLD}%",
         parse_mode="HTML"

@@ -18,6 +18,9 @@ CHAT_ID = 7200809630
 BASE_URL = "https://inforadar.live"
 SPORT_ID = 18
 SCAN_INTERVAL = 60
+AUTO_START = True  # fully automatic on launch, no commands needed
+NEW_GAME_ALERT = True  # notify when new games enter Q2
+ALL_PREDICTIONS = False  # True = send all picks, False = only #1 best
 CONFIDENCE_THRESHOLD = 60
 MAX_GAMES_IN_MEMORY = 20
 REQUEST_TIMEOUT = 8
@@ -71,6 +74,7 @@ auto_tracking = False
 scan_thread = None
 scan_count = 0
 pred_count = 0
+known_games = set()  # track seen game IDs for new-game alerts
 
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
@@ -417,10 +421,10 @@ def scan_and_predict():
 
     results = []
     def work(g):
+        nonlocal results
         odds = fetch_odds(g["id"])
         if not odds: return None
         preds, markets = analyze_game(g, odds)
-        if preds: pred_count += 1
         return (g, markets, preds)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -432,7 +436,9 @@ def scan_and_predict():
                     g, markets, preds = r
                     for p in preds:
                         results.append((g, p))
-            except Exception:
+                        pred_count += 1
+            except Exception as e:
+                print(f'Worker error: {e}')
                 continue
 
     results.sort(key=lambda x: x[1]["confidence"], reverse=True)
@@ -441,19 +447,100 @@ def scan_and_predict():
     return None, None, [], games
 
 
+# ─── AUTO-SCAN BACKGROUND WORKER ─────────────────────────────────────────
+def auto_scan_worker():
+    """Fully automatic background scanner. Runs forever, pushes predictions."""
+    global auto_tracking, known_games
+    auto_tracking = True
+    cycle = 0
+
+    while auto_tracking:
+        cycle += 1
+        try:
+            bg, bp, all_results, games = scan_and_predict()
+
+            # --- New game alerts: notify when games enter Q2 ---
+            if games and NEW_GAME_ALERT:
+                current_ids = {g["id"] for g in games if get_quarter(g) >= 2}
+                new_ids = current_ids - known_games
+                if new_ids:
+                    new_games = [g for g in games if g["id"] in new_ids]
+                    for ng in new_games[:5]:
+                        bot.send_message(CHAT_ID,
+                            f"\U0001f3c0 <b>New game entered Q2+</b>\n"
+                            f"{ng['home']['name']} vs {ng['away']['name']}\n"
+                            f"{ng['league']['name']} | {ng.get('scores', '0-0')}\n"
+                            f"\U0001f4c5 ID: <code>{ng['id']}</code>",
+                            parse_mode="HTML"
+                        )
+                known_games = current_ids
+
+            # --- Send predictions ---
+            print(f'Cycle {cycle}: {len(games)} games, {len(all_results)} predictions')
+            if bg and bp:
+                if ALL_PREDICTIONS and all_results:
+                    for g, p in all_results:
+                        key = f"{g['id']}_{p['type']}"
+                        old = last_predictions.get(key, 0)
+                        new_conf = p["confidence"]
+                        if abs(new_conf - old) >= 5:
+                            rank = 1 if (g, p) == (bg, bp) else 2
+                            bot.send_message(CHAT_ID, fmt_pred(g, p, rank=rank), parse_mode="HTML")
+                            last_predictions[key] = new_conf
+                            print(f'  Sent: {p["type"]} {p["pick"]} {p["confidence"]}%')
+                else:
+                    key = f"{bg['id']}_{bp['type']}"
+                    old = last_predictions.get(key, 0)
+                    new_conf = bp["confidence"]
+                    if abs(new_conf - old) >= 5:
+                        bot.send_message(CHAT_ID, fmt_pred(bg, bp, rank=1), parse_mode="HTML")
+                        last_predictions[key] = new_conf
+                        print(f'  Sent: {bp["type"]} {bp["pick"]} {bp["confidence"]}%')
+                    else:
+                        print(f'  Dedup: {bp["type"]} {bp["confidence"]}% (old={old})')
+            else:
+                print(f'  No predictions this cycle')
+
+            # Periodic status every 10 cycles (10 min)
+            if cycle % 10 == 0 and games:
+                eligible = len([g for g in games if get_quarter(g) >= 2])
+                bot.send_message(CHAT_ID,
+                    f"\U0001f4ca Scan #{scan_count} | {len(games)} live | {eligible} analyzing | {pred_count} predictions sent",
+                    parse_mode="HTML"
+                )
+
+        except Exception as e:
+            print(f'Scan cycle {cycle} error: {e}')
+
+        # Sleep in 1-second increments for instant stop capability
+        for _ in range(SCAN_INTERVAL):
+            if not auto_tracking:
+                break
+            time.sleep(1)
+
+
+def start_auto_scan():
+    """Start the auto-scan background thread (called once at boot)."""
+    global scan_thread, auto_tracking
+    if auto_tracking:
+        return
+    auto_tracking = True
+    scan_thread = threading.Thread(target=auto_scan_worker, daemon=True)
+    scan_thread.start()
+
+
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     bot.reply_to(msg,
         "\U0001f3c0 <b>Basketball Prediction Bot</b>\n"
-        "Analyzes opening vs in-play odds.\n\n"
-        "/scan - Best pick now\n"
-        "/scan all - All predictions\n"
-        "/game &lt;id&gt; - Game details\n"
-        "/track - Auto-scan 60s\n"
-        "/stop - Stop auto-scan\n"
-        "/status - Bot stats\n"
-        "/help - Show commands",
+        "\u26a1 <b>Fully automatic</b> - predictions auto-sent!\n\n"
+        "Optional commands:\n"
+        "/scan all - All predictions now\n"
+        "/stop - Pause\n"
+        "/track - Resume\n"
+        "/status - Stats\n"
+        "/live - Live games list",
         parse_mode="HTML"
     )
 
@@ -539,50 +626,22 @@ def cmd_game(msg):
 
 @bot.message_handler(commands=["track"])
 def cmd_track(msg):
-    global auto_tracking, scan_thread
+    global auto_tracking
     if auto_tracking:
         bot.reply_to(msg, "\u26a1 Auto-scan is already running!", parse_mode="HTML")
         return
-    auto_tracking = True
-    bot.reply_to(msg, "\u2705 Auto-scan STARTED (every 60s).\nUse /stop to pause.", parse_mode="HTML")
-
-    def auto_loop():
-        global auto_tracking
-        while auto_tracking:
-            try:
-                bg, bp, all_r, games = scan_and_predict()
-                if bg and bp:
-                    # Dedup: only send if confidence changed by 5+
-                    key = bg["id"]
-                    old = last_predictions.get(key, {}).get(bp["type"], 0)
-                    new_conf = bp["confidence"]
-                    if abs(new_conf - old) >= 5:
-                        text = fmt_pred(bg, bp, rank=1)
-                        bot.send_message(CHAT_ID, text, parse_mode="HTML")
-                        if key not in last_predictions:
-                            last_predictions[key] = {}
-                        last_predictions[key][bp["type"]] = new_conf
-            except Exception:
-                pass
-            # Sleep in small increments so we can stop quickly
-            for _ in range(SCAN_INTERVAL):
-                if not auto_tracking:
-                    break
-                time.sleep(1)
-
-    scan_thread = threading.Thread(target=auto_loop, daemon=True)
-    scan_thread.start()
+    start_auto_scan()
+    bot.reply_to(msg, "\u2705 Auto-scan RESUMED.", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["stop"])
 def cmd_stop(msg):
     global auto_tracking
     if not auto_tracking:
-        bot.reply_to(msg, "\u23f9 Auto-scan is not running.", parse_mode="HTML")
+        bot.reply_to(msg, "\u23f9 Already paused.", parse_mode="HTML")
         return
     auto_tracking = False
-    last_predictions.clear()
-    bot.reply_to(msg, "\u23f9 Auto-scan STOPPED.\nUse /track to resume.", parse_mode="HTML")
+    bot.reply_to(msg, "\u23f9 Auto-scan PAUSED.\nUse /track to resume.", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["status"])
@@ -627,6 +686,23 @@ if __name__ == "__main__":
     print(f"   Chat ID: {CHAT_ID}")
     print(f"   Scan interval: {SCAN_INTERVAL}s")
     print(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}%")
+    print(f"   Auto-start: {AUTO_START}")
     print(f"   3G optimized: timeout={REQUEST_TIMEOUT}s, workers={MAX_WORKERS}")
-    bot.send_message(CHAT_ID, "\U0001f3c0 <b>Bot Online!</b>\nUse /scan to find predictions.\nUse /track for auto-scan.", parse_mode="HTML")
+
+    _VER = "v2.1"
+
+    # Launch message
+    mode = "\U0001f525 FULLY AUTOMATIC" if AUTO_START else "manual"
+    bot.send_message(CHAT_ID,
+        f"\U0001f3c0 <b>Bot Online! {_VER} {mode}</b>\n"
+        f"Scanning every {SCAN_INTERVAL}s. Predictions auto-sent.\n"
+        f"Confidence threshold: {CONFIDENCE_THRESHOLD}%",
+        parse_mode="HTML"
+    )
+
+    # Auto-start background scanner
+    if AUTO_START:
+        start_auto_scan()
+        print("   Auto-scan started (background)")
+
     bot.polling(timeout=30, long_polling_timeout=25)
