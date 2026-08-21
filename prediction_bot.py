@@ -615,7 +615,7 @@ def _settle_bet(final_home, final_away):
         icon = "\u274c"
     else:
         draws += 1
-        streak = 0
+        # Keep streak unchanged on draw
         icon = "\u26aa"
 
     # Send settlement message
