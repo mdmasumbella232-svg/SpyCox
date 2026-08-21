@@ -10,7 +10,6 @@ import requests
 import time
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 BOT_TOKEN = "8995554775:AAGuxzPuR5kYKaqAt7MFGia5BcvFOk5enW8"
@@ -420,26 +419,17 @@ def scan_and_predict():
         return None, None, [], games
 
     results = []
-    def work(g):
-        nonlocal results
-        odds = fetch_odds(g["id"])
-        if not odds: return None
-        preds, markets = analyze_game(g, odds)
-        return (g, markets, preds)
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futs = {ex.submit(work, g): g for g in eligible}
-        for f in as_completed(futs, timeout=30):
-            try:
-                r = f.result()
-                if r:
-                    g, markets, preds = r
-                    for p in preds:
-                        results.append((g, p))
-                        pred_count += 1
-            except Exception as e:
-                print(f'Worker error: {e}')
+    for g in eligible:
+        try:
+            odds = fetch_odds(g["id"])
+            if not odds:
                 continue
+            preds, markets = analyze_game(g, odds)
+            for p in preds:
+                results.append((g, p))
+                pred_count += 1
+        except Exception as e:
+            print(f'Error analyzing {g["id"]}: {e}')
 
     results.sort(key=lambda x: x[1]["confidence"], reverse=True)
     if results:
