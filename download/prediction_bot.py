@@ -77,6 +77,17 @@ pred_count = 0
 known_games = set()  # track seen game IDs for new-game alerts
 last_predictions = {}  # dedup: key -> last confidence sent
 
+# ─── BET LOCKING & W/L TRACKING ───────────────────────────────────────────
+active_bet = None       # {"game_id", "pick", "type", "confidence", "odds", "line", "home", "away", "msg_id", "time"}
+bet_lock = False         # True = no new picks until this bet settles
+wins = 0
+losses = 0
+draws = 0
+total_bets = 0
+streak = 0              # positive = win streak, negative = loss streak
+best_win_streak = 0
+best_loss_streak = 0
+
 
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 def fetch_live_games():
@@ -322,11 +333,27 @@ def analyze_game(game, odds_data):
 
 
 # ─── MESSAGE FORMATTING ───────────────────────────────────────────────────────
+def fmt_wl_stats():
+    """Return W/L/D stats string like: W7 / L9 / D1 | Bets: 17 | Hit: 41.2% | Streak: -3 | BestW: 3 | BestL: -3"""
+    if total_bets == 0:
+        return ""
+    hit_pct = round((wins / total_bets) * 100, 1) if total_bets > 0 else 0
+    streak_str = f"+{streak}" if streak > 0 else str(streak)
+    return (
+        f"\U0001f4ca W{wins} / L{losses} / D{draws} | "
+        f"Bets: {total_bets} | Hit: {hit_pct}% | "
+        f"Streak: {streak_str} | BestW: {best_win_streak} | BestL: -{best_loss_streak}"
+    )
+
+
 def fmt_pred(game, pred, rank=1):
     home = game["home"]["name"]
     away = game["away"]["name"]
     league = game["league"]["name"]
+    eid = game["id"]
     icon = "\U0001f525" if rank == 1 else "\u26a1"
+    game_link = f"https://inforadar.live/#/dashboard/basketball/game/{eid}"
+
     lines = [
         f"{icon} #{rank} {pred['type']}",
         f"{home} vs {away}",
@@ -336,7 +363,9 @@ def fmt_pred(game, pred, rank=1):
     ]
     d = pred["details"]
     if pred["type"] == "MONEYLINE":
-        lines.append(f"Pick: <b>{pred['pick']}</b>")
+        # Show real current odds next to pick
+        real_odds = d['cur_away'] if pred['pick'] == "AWAY" else d['cur_home']
+        lines.append(f"Pick: <b>{pred['pick']}@{real_odds}</b>")
         lines.append(f"Opening: H {d['op_home']} / A {d['op_away']}")
         lines.append(f"Current: H {d['cur_home']} / A {d['cur_away']}")
         hs = f"+{d['home_shift']}%" if d['home_shift'] > 0 else f"{d['home_shift']}%"
@@ -346,7 +375,9 @@ def fmt_pred(game, pred, rank=1):
         if rb > 0:
             lines.append(f"Rating confirm: +{rb}%")
     else:
-        lines.append(f"Pick: <b>{pred['pick']} {pred['line']}</b>")
+        # Show real current odds next to pick
+        real_odds = d['cur_under_odds'] if pred['pick'] == "UNDER" else d['cur_over_odds']
+        lines.append(f"Pick: <b>{pred['pick']} {pred['line']}@{real_odds}</b>")
         lines.append(f"Line: {d['op_line']} -> {d['cur_line']} ({d['line_move']:+.1f})")
         lines.append(f"Score: {d['current_score']}pts in {d['elapsed_min']}min")
         lines.append(f"Pace: {d['projected_total']}pts (gap {d['pace_gap']:+.1f})")
@@ -356,15 +387,23 @@ def fmt_pred(game, pred, rank=1):
             lines.append(f"Rating confirm: +{rb}%")
         elif rb < 0:
             lines.append(f"Rating disagree: {rb}%")
-    return "\n".join(lines), game["id"]
+
+    # Clickable game ID + link + lock status
+    lines.append("")
+    lines.append(f"ID: <a href=\"{game_link}\">{eid}</a>")
+    if bet_lock and active_bet:
+        lines.append(f"Status: Bot is locked. No new picks until this bet settles.")
+    return "\n".join(lines), eid
 
 
 def send_pred_with_button(game, pred, rank=1):
-    """Send prediction message with clickable 'Match Details' button."""
+    """Send prediction message with clickable game ID link + Match Details button."""
     text, eid = fmt_pred(game, pred, rank=rank)
+    game_link = f"https://inforadar.live/#/dashboard/basketball/game/{eid}"
     markup = InlineKeyboardMarkup()
-    markup.add(InlineKeyboardButton(f"\U0001f4c5 Match Details ({eid})", callback_data=f"detail_{eid}"))
-    bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="HTML")
+    markup.add(InlineKeyboardButton("\U0001f4c5 Match Details", url=game_link))
+    msg = bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="HTML")
+    return msg.message_id
 
 
 def fmt_all(results):
@@ -448,6 +487,147 @@ def scan_and_predict():
     return None, None, [], games
 
 
+# ─── BET LOCKING & SETTLEMENT ──────────────────────────────────────────
+def _lock_bet(game, pred, msg_id):
+    """Lock the bot after sending a pick. No new picks until this settles."""
+    global bet_lock, active_bet
+    d = pred["details"]
+    if pred["type"] == "MONEYLINE":
+        odds = d['cur_away'] if pred['pick'] == "AWAY" else d['cur_home']
+    else:
+        odds = d['cur_under_odds'] if pred['pick'] == "UNDER" else d['cur_over_odds']
+    hs, as_ = get_scores(game)
+    active_bet = {
+        "game_id": game["id"],
+        "pick": pred["pick"],
+        "type": pred["type"],
+        "confidence": pred["confidence"],
+        "odds": odds,
+        "line": pred.get("line"),
+        "home": game["home"]["name"],
+        "away": game["away"]["name"],
+        "msg_id": msg_id,
+        "time": time.time(),
+        "last_home_score": hs,
+        "last_away_score": as_,
+    }
+    bet_lock = True
+
+
+def _check_settlement(live_games):
+    """Check if the locked game has ended (not in live list anymore)."""
+    global bet_lock, active_bet
+    if not bet_lock or not active_bet:
+        return
+    gid = active_bet["game_id"]
+    still_live = any(g["id"] == gid for g in live_games)
+    if still_live:
+        # Update last known score while game is still live
+        for g in live_games:
+            if g["id"] == gid:
+                hs, as_ = get_scores(g)
+                active_bet["last_home_score"] = hs
+                active_bet["last_away_score"] = as_
+                break
+        return
+    # Game ended - settle the bet
+    hs = active_bet["last_home_score"]
+    as_ = active_bet["last_away_score"]
+    _settle_bet(hs, as_)
+
+
+def _settle_bet(final_home, final_away):
+    """Determine W/L/D, update stats, send settlement message, unlock."""
+    global bet_lock, active_bet, wins, losses, draws, total_bets, streak
+    global best_win_streak, best_loss_streak
+
+    if not active_bet:
+        bet_lock = False
+        return
+
+    pick = active_bet["pick"]
+    btype = active_bet["type"]
+    line = active_bet["line"]
+    odds = active_bet["odds"]
+    home_name = active_bet["home"]
+    away_name = active_bet["away"]
+    gid = active_bet["game_id"]
+
+    result = None  # "WIN", "LOSS", "DRAW"
+
+    if btype == "MONEYLINE":
+        if final_home > final_away:
+            result = "WIN" if pick == "HOME" else "LOSS"
+        elif final_away > final_home:
+            result = "WIN" if pick == "AWAY" else "LOSS"
+        else:
+            result = "DRAW"
+        total_str = f"Final Score: {final_home}-{final_away}"
+    else:  # TOTAL
+        total_score = final_home + final_away
+        if line is not None:
+            total_str = f"Final Total Score: {total_score} (Line was {line} {pick})"
+            if pick == "OVER":
+                if total_score > line:
+                    result = "WIN"
+                elif total_score < line:
+                    result = "LOSS"
+                else:
+                    result = "DRAW"
+            else:  # UNDER
+                if total_score < line:
+                    result = "WIN"
+                elif total_score > line:
+                    result = "LOSS"
+                else:
+                    result = "DRAW"
+        else:
+            total_str = f"Final Total Score: {total_score}"
+            result = "DRAW"  # can't determine without line
+
+    # Update stats
+    total_bets += 1
+    if result == "WIN":
+        wins += 1
+        if streak >= 0:
+            streak += 1
+        else:
+            streak = 1
+        best_win_streak = max(best_win_streak, streak)
+        icon = "\u2705"
+    elif result == "LOSS":
+        losses += 1
+        if streak <= 0:
+            streak -= 1
+        else:
+            streak = -1
+        best_loss_streak = max(best_loss_streak, abs(streak))
+        icon = "\u274c"
+    else:
+        draws += 1
+        streak = 0
+        icon = "\u26aa"
+
+    # Send settlement message
+    settle_text = (
+        f"{icon} Bet Settled: <b>{result}</b>\n"
+        f"\U0001f3c0 {home_name} vs {away_name}\n"
+        f"{total_str}\n"
+        f"Pick: {pick}@{odds}"
+    )
+    wl = fmt_wl_stats()
+    if wl:
+        settle_text += f"\n\n{wl}"
+    try:
+        bot.send_message(CHAT_ID, settle_text, parse_mode="HTML")
+    except Exception:
+        pass
+
+    # Unlock
+    active_bet = None
+    bet_lock = False
+
+
 # ─── AUTO-SCAN BACKGROUND WORKER ─────────────────────────────────────────
 def auto_scan_worker():
     """Fully automatic background scanner. Runs forever, pushes predictions."""
@@ -459,6 +639,10 @@ def auto_scan_worker():
         cycle += 1
         try:
             bg, bp, all_results, games = scan_and_predict()
+
+            # --- Check if locked bet has settled ---
+            if bet_lock:
+                _check_settlement(games if games else [])
 
             # --- New game alerts: notify when games enter Q2 ---
             if games and NEW_GAME_ALERT:
@@ -476,8 +660,8 @@ def auto_scan_worker():
                         )
                 known_games = current_ids
 
-            # --- Send predictions ---
-            if bg and bp:
+            # --- Send predictions (respect bet lock) ---
+            if bg and bp and not bet_lock:
                 if ALL_PREDICTIONS and all_results:
                     for g, p in all_results:
                         key = f"{g['id']}_{p['type']}"
@@ -485,23 +669,31 @@ def auto_scan_worker():
                         new_conf = p["confidence"]
                         if abs(new_conf - old) >= 5:
                             rank = 1 if (g, p) == (bg, bp) else 2
-                            send_pred_with_button(g, p, rank=rank)
+                            msg_id = send_pred_with_button(g, p, rank=rank)
                             last_predictions[key] = new_conf
+                            # Lock on first pick sent
+                            if not bet_lock:
+                                _lock_bet(g, p, msg_id)
+                                break  # locked, stop sending more
                 else:
                     key = f"{bg['id']}_{bp['type']}"
                     old = last_predictions.get(key, 0)
                     new_conf = bp["confidence"]
                     if abs(new_conf - old) >= 5:
-                        send_pred_with_button(bg, bp, rank=1)
+                        msg_id = send_pred_with_button(bg, bp, rank=1)
                         last_predictions[key] = new_conf
+                        _lock_bet(bg, bp, msg_id)
 
             # Periodic status every 10 cycles (10 min)
             if cycle % 10 == 0 and games:
                 eligible = len([g for g in games if get_quarter(g) >= 2])
-                bot.send_message(CHAT_ID,
-                    f"\U0001f4ca Scan #{scan_count} | {len(games)} live | {eligible} analyzing | {pred_count} predictions sent",
-                    parse_mode="HTML"
-                )
+                status_line = f"\U0001f4ca Scan #{scan_count} | {len(games)} live | {eligible} analyzing | {pred_count} predictions sent"
+                wl = fmt_wl_stats()
+                if wl:
+                    status_line += f"\n{wl}"
+                if bet_lock and active_bet:
+                    status_line += f"\n\U0001f512 Locked: {active_bet['pick']}@{active_bet['odds']} ({active_bet['home']} vs {active_bet['away']})"
+                bot.send_message(CHAT_ID, status_line, parse_mode="HTML")
 
         except Exception as e:
             print(f'Cycle {cycle} error: {e}')
@@ -568,7 +760,9 @@ def cmd_start(msg):
         "/scan all - All predictions now\n"
         "/stop - Pause\n"
         "/track - Resume\n"
-        "/status - Stats\n"
+        "/status - Stats + W/L\n"
+        "/unlock - Force-unlock bet\n"
+        "/resetwl - Reset W/L record\n"
         "/live - Live games list",
         parse_mode="HTML"
     )
@@ -583,7 +777,9 @@ def cmd_help(msg):
         "/game &lt;event_id&gt; - Detailed odds\n"
         "/track - Auto-scan every 60s\n"
         "/stop - Stop auto-scan\n"
-        "/status - Bot status & stats\n\n"
+        "/status - Bot status + W/L record\n"
+        "/unlock - Force-unlock current bet\n"
+        "/resetwl - Reset W/L/D stats\n\n"
         "<b>Prediction types:</b>\n"
         "- MONEYLINE (Home/Away)\n"
         "- TOTAL Over/Under\n\n"
@@ -603,13 +799,25 @@ def cmd_help(msg):
 @bot.message_handler(commands=["scan"])
 def cmd_scan(msg):
     send_all = "all" in msg.text.lower()
+    if bet_lock and active_bet:
+        bot.reply_to(msg,
+            f"\U0001f512 <b>Bot is locked.</b> No new picks until current bet settles.\n"
+            f"Active: {active_bet['pick']}@{active_bet['odds']} ({active_bet['home']} vs {active_bet['away']})\n"
+            f"Use /unlock to force-unlock.",
+            parse_mode="HTML"
+        )
+        return
     bot.reply_to(msg, "\u23f3 Scanning live games...", parse_mode="HTML")
     bg, bp, all_r, _ = scan_and_predict()
     if send_all:
+        if not all_r:
+            bot.send_message(CHAT_ID, "No high-confidence predictions found.\nTry /scan all or wait for games to reach Q2+.", parse_mode="HTML")
+            return
         text = fmt_all(all_r)
         bot.send_message(CHAT_ID, text, parse_mode="HTML")
     elif bg and bp:
-        send_pred_with_button(bg, bp, rank=1)
+        msg_id = send_pred_with_button(bg, bp, rank=1)
+        _lock_bet(bg, bp, msg_id)
     else:
         bot.send_message(CHAT_ID, "No high-confidence predictions found.\nTry /scan all or wait for games to reach Q2+.", parse_mode="HTML")
 
@@ -687,10 +895,43 @@ def cmd_status(msg):
         f"Interval: {SCAN_INTERVAL}s\n"
         f"Confidence threshold: {CONFIDENCE_THRESHOLD}%"
     )
+    wl = fmt_wl_stats()
+    if wl:
+        text += f"\n\n{wl}"
+    if bet_lock and active_bet:
+        text += f"\n\n\U0001f512 <b>LOCKED</b>: {active_bet['pick']}@{active_bet['odds']}\n{active_bet['home']} vs {active_bet['away']}"
     bot.send_message(CHAT_ID, text, parse_mode="HTML")
 
 
 # ─── INLINE GAME LIST (quick access) ─────────────────────────────────────────
+@bot.message_handler(commands=["resetwl"])
+def cmd_resetwl(msg):
+    """Reset W/L/D stats."""
+    global wins, losses, draws, total_bets, streak, best_win_streak, best_loss_streak, bet_lock, active_bet
+    wins = losses = draws = total_bets = streak = best_win_streak = best_loss_streak = 0
+    bet_lock = False
+    active_bet = None
+    bot.reply_to(msg, "\u2705 W/L/D stats reset to zero. Bet lock cleared.", parse_mode="HTML")
+
+
+@bot.message_handler(commands=["unlock"])
+def cmd_unlock(msg):
+    """Manually unlock the bot (force-unlock current bet without settling)."""
+    global bet_lock, active_bet
+    if not bet_lock:
+        bot.reply_to(msg, "\u23f9 No active bet lock.", parse_mode="HTML")
+        return
+    old = active_bet
+    bet_lock = False
+    active_bet = None
+    bot.reply_to(msg,
+        f"\U0001f513 <b>Force unlocked</b>\n"
+        f"Dropped: {old['pick']}@{old['odds']} ({old['home']} vs {old['away']})\n"
+        f"Bet was NOT settled (no W/L recorded).",
+        parse_mode="HTML"
+    )
+
+
 @bot.message_handler(commands=["live"])
 def cmd_live(msg):
     games = fetch_live_games()
@@ -717,16 +958,20 @@ if __name__ == "__main__":
     print(f"   Auto-start: {AUTO_START}")
     print(f"   3G optimized: timeout={REQUEST_TIMEOUT}s, workers={MAX_WORKERS}")
 
-    _VER = "v3.0"
+    _VER = "v4.0"
 
     # Launch message
     mode = "\U0001f525 FULLY AUTOMATIC" if AUTO_START else "manual"
-    bot.send_message(CHAT_ID,
-        f"\U0001f3c0 <b>Bot Online! {_VER} {mode}</b>\n"
+    launch_msg = (
+        f"\U0001f3c0 <b>Bot Online! {_VER}</b> {mode}\n"
         f"Scanning every {SCAN_INTERVAL}s. Predictions auto-sent.\n"
-        f"Confidence threshold: {CONFIDENCE_THRESHOLD}%",
-        parse_mode="HTML"
+        f"Confidence threshold: {CONFIDENCE_THRESHOLD}%\n"
+        f"Bet lock: ON (waits for settlement)"
     )
+    wl = fmt_wl_stats()
+    if wl:
+        launch_msg += f"\n{wl}"
+    bot.send_message(CHAT_ID, launch_msg, parse_mode="HTML")
 
     # Auto-start background scanner
     if AUTO_START:
