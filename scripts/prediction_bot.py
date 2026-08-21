@@ -6,6 +6,7 @@ Optimized for 3G / low RAM / low CPU
 """
 
 import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 import time
 import threading
@@ -18,7 +19,7 @@ BASE_URL = "https://inforadar.live"
 SPORT_ID = 18
 SCAN_INTERVAL = 60
 AUTO_START = True  # fully automatic on launch, no commands needed
-NEW_GAME_ALERT = True  # notify when new games enter Q2
+NEW_GAME_ALERT = False  # notify when new games enter Q2
 ALL_PREDICTIONS = False  # True = send all picks, False = only #1 best
 CONFIDENCE_THRESHOLD = 60
 MAX_GAMES_IN_MEMORY = 20
@@ -355,7 +356,15 @@ def fmt_pred(game, pred, rank=1):
             lines.append(f"Rating confirm: +{rb}%")
         elif rb < 0:
             lines.append(f"Rating disagree: {rb}%")
-    return "\n".join(lines)
+    return "\n".join(lines), game["id"]
+
+
+def send_pred_with_button(game, pred, rank=1):
+    """Send prediction message with clickable 'Match Details' button."""
+    text, eid = fmt_pred(game, pred, rank=rank)
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(f"\U0001f4c5 Match Details ({eid})", callback_data=f"detail_{eid}"))
+    bot.send_message(CHAT_ID, text, reply_markup=markup, parse_mode="HTML")
 
 
 def fmt_all(results):
@@ -363,7 +372,8 @@ def fmt_all(results):
         return "No high-confidence predictions found.\nGames may be too early (need Q2+) or odds haven't moved enough."
     lines = [f"\U0001f525 <b>LIVE PREDICTIONS</b> ({len(results)} picks)", ""]
     for i, (g, p) in enumerate(results):
-        lines.append(fmt_pred(g, p, rank=i + 1))
+        txt, _ = fmt_pred(g, p, rank=i + 1)
+        lines.append(txt)
         lines.append("")
     return "\n".join(lines)
 
@@ -475,14 +485,14 @@ def auto_scan_worker():
                         new_conf = p["confidence"]
                         if abs(new_conf - old) >= 5:
                             rank = 1 if (g, p) == (bg, bp) else 2
-                            bot.send_message(CHAT_ID, fmt_pred(g, p, rank=rank), parse_mode="HTML")
+                            send_pred_with_button(g, p, rank=rank)
                             last_predictions[key] = new_conf
                 else:
                     key = f"{bg['id']}_{bp['type']}"
                     old = last_predictions.get(key, 0)
                     new_conf = bp["confidence"]
                     if abs(new_conf - old) >= 5:
-                        bot.send_message(CHAT_ID, fmt_pred(bg, bp, rank=1), parse_mode="HTML")
+                        send_pred_with_button(bg, bp, rank=1)
                         last_predictions[key] = new_conf
 
             # Periodic status every 10 cycles (10 min)
@@ -511,6 +521,41 @@ def start_auto_scan():
     auto_tracking = True
     scan_thread = threading.Thread(target=auto_scan_worker, daemon=True)
     scan_thread.start()
+
+
+# ─── INLINE BUTTON HANDLER ─────────────────────────────────────────────
+@bot.callback_query_handler(func=lambda call: call.data.startswith("detail_"))
+def on_detail_button(call):
+    """Handle 'Match Details' button click - show full odds breakdown."""
+    eid = call.data.replace("detail_", "")
+    bot.answer_callback_query(call.id, f"Fetching {eid}...")
+    odds = fetch_odds(eid)
+    if not odds:
+        bot.send_message(call.message.chat.id, f"No odds data for <code>{eid}</code>", parse_mode="HTML")
+        return
+    markets = parse_markets(odds)
+    # Build minimal game dict from odds data
+    sample = None
+    for m in odds:
+        inplay = [o for o in m.get("odds", []) if o.get("game_time") != ""]
+        if inplay:
+            s = inplay[0].get("ss", [0, 0])
+            gt = inplay[0].get("game_time", "")
+            sample = {
+                "home": {"name": "Home"}, "away": {"name": "Away"},
+                "league": {"name": "N/A"},
+                "scores": f"{s[0] if s[0] else '?'}-{s[1] if s[1] else '?'}",
+                "time": {"q": gt.split(" - ")[0].replace("Q","").strip() if " - " in gt else "?",
+                         "tm": "0", "ts": "0"},
+            }
+            break
+    if not sample:
+        sample = {"home": {"name": "Home"}, "away": {"name": "Away"},
+                 "league": {"name": "N/A"}, "scores": "?-?",
+                 "time": {"q": "0", "tm": "0", "ts": "0"}}
+    preds, _ = analyze_game(sample, odds)
+    text = fmt_detail(sample, markets, preds)
+    bot.send_message(call.message.chat.id, text, parse_mode="HTML")
 
 
 # ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
@@ -562,12 +607,11 @@ def cmd_scan(msg):
     bg, bp, all_r, _ = scan_and_predict()
     if send_all:
         text = fmt_all(all_r)
+        bot.send_message(CHAT_ID, text, parse_mode="HTML")
+    elif bg and bp:
+        send_pred_with_button(bg, bp, rank=1)
     else:
-        if bg and bp:
-            text = fmt_pred(bg, bp, rank=1)
-        else:
-            text = "No high-confidence predictions found.\nTry /scan all or wait for games to reach Q2+."
-    bot.send_message(CHAT_ID, text, parse_mode="HTML")
+        bot.send_message(CHAT_ID, "No high-confidence predictions found.\nTry /scan all or wait for games to reach Q2+.", parse_mode="HTML")
 
 
 @bot.message_handler(commands=["game"])
