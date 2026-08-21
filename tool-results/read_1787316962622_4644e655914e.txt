@@ -1,0 +1,711 @@
+     1→#!/usr/bin/env python3
+     2→"""
+     3→Lightweight Basketball Prediction Telegram Bot
+     4→Opens odds vs In-Play odds analysis | MONEYLINE + Total O/U
+     5→Optimized for 3G / low RAM / low CPU
+     6→"""
+     7→
+     8→import telebot
+     9→import requests
+    10→import time
+    11→import threading
+    12→from collections import OrderedDict
+    13→
+    14→# ─── CONFIG ───────────────────────────────────────────────────────────────────
+    15→BOT_TOKEN = "8995554775:AAGuxzPuR5kYKaqAt7MFGia5BcvFOk5enW8"
+    16→CHAT_ID = 7200809630
+    17→BASE_URL = "https://inforadar.live"
+    18→SPORT_ID = 18
+    19→SCAN_INTERVAL = 60
+    20→AUTO_START = True  # fully automatic on launch, no commands needed
+    21→NEW_GAME_ALERT = True  # notify when new games enter Q2
+    22→ALL_PREDICTIONS = False  # True = send all picks, False = only #1 best
+    23→CONFIDENCE_THRESHOLD = 60
+    24→MAX_GAMES_IN_MEMORY = 20
+    25→REQUEST_TIMEOUT = 8
+    26→MAX_WORKERS = 3
+    27→
+    28→# ─── HTTP SESSION (keep-alive, gzip, 3G optimized) ───────────────────────────
+    29→_session = requests.Session()
+    30→_session.headers.update({"Accept": "application/json", "Accept-Encoding": "gzip"})
+    31→_session.mount("https://", requests.adapters.HTTPAdapter(
+    32→    pool_connections=3, pool_maxsize=6, max_retries=1
+    33→))
+    34→
+    35→
+    36→def api_get(path, params=None):
+    37→    try:
+    38→        r = _session.get(f"{BASE_URL}{path}", params=params, timeout=REQUEST_TIMEOUT)
+    39→        r.raise_for_status()
+    40→        return r.json()
+    41→    except Exception:
+    42→        return None
+    43→
+    44→
+    45→# ─── LRU CACHE ────────────────────────────────────────────────────────────────
+    46→class LRUCache:
+    47→    def __init__(self, maxsize=MAX_GAMES_IN_MEMORY):
+    48→        self._cache = OrderedDict()
+    49→        self._maxsize = maxsize
+    50→
+    51→    def get(self, key):
+    52→        if key in self._cache:
+    53→            self._cache.move_to_end(key)
+    54→            return self._cache[key]
+    55→        return None
+    56→
+    57→    def set(self, key, value):
+    58→        if key in self._cache:
+    59→            self._cache.move_to_end(key)
+    60→        self._cache[key] = value
+    61→        while len(self._cache) > self._maxsize:
+    62→            self._cache.popitem(last=False)
+    63→
+    64→    def clear(self):
+    65→        self._cache.clear()
+    66→
+    67→
+    68→opening_cache = LRUCache()
+    69→
+    70→# ─── BOT STATE ────────────────────────────────────────────────────────────────
+    71→bot = telebot.TeleBot(BOT_TOKEN)
+    72→auto_tracking = False
+    73→scan_thread = None
+    74→scan_count = 0
+    75→pred_count = 0
+    76→known_games = set()  # track seen game IDs for new-game alerts
+    77→last_predictions = {}  # dedup: key -> last confidence sent
+    78→
+    79→
+    80→# ─── DATA FETCHING ────────────────────────────────────────────────────────────
+    81→def fetch_live_games():
+    82→    data = api_get("/api/v1/live_games", {"sport_id": SPORT_ID, "page": 1, "per_page": 1000})
+    83→    if not data or not data.get("success"):
+    84→        return []
+    85→    return data.get("results", [])
+    86→
+    87→
+    88→def fetch_odds(event_id):
+    89→    data = api_get("/api/v1/basketball/game/odds", {
+    90→        "event_id": event_id, "odds_market": "1,2,3,4,5,6"
+    91→    })
+    92→    if not data or not isinstance(data, list):
+    93→        return []
+    94→    return data
+    95→
+    96→
+    97→def fetch_game_view(event_id):
+    98→    return api_get("/api/v1/basketball/game/view", {"event_id": event_id})
+    99→
+   100→
+   101→# ─── PARSING ──────────────────────────────────────────────────────────────────
+   102→def parse_markets(odds_data):
+   103→    markets = {}
+   104→    for m in odds_data:
+   105→        name = m.get("name", "")
+   106→        odds_list = m.get("odds", [])
+   107→        if not odds_list:
+   108→            continue
+   109→        opening_entries = [o for o in odds_list if o.get("game_time") == ""]
+   110→        inplay_entries = [o for o in odds_list if o.get("game_time") != ""]
+   111→        markets[name] = {
+   112→            "rows": m.get("rowsNames", []),
+   113→            "full_time": m.get("fullTime", 2400),
+   114→            "opening": opening_entries[-1] if opening_entries else None,
+   115→            "latest": inplay_entries[0] if inplay_entries else None,
+   116→            "inplay_count": len(inplay_entries),
+   117→        }
+   118→    return markets
+   119→
+   120→
+   121→def implied_prob(odds_decimal):
+   122→    if not odds_decimal or odds_decimal <= 1.01:
+   123→        return 1.0 if odds_decimal and odds_decimal <= 1.01 else 0.0
+   124→    return 1.0 / odds_decimal
+   125→
+   126→
+   127→def get_quarter(game):
+   128→    try: return int(game.get("time", {}).get("q", 0))
+   129→    except (ValueError, TypeError): return 0
+   130→
+   131→
+   132→def get_elapsed_sec(game):
+   133→    t = game.get("time", {})
+   134→    try:
+   135→        q = int(t.get("q", 0))
+   136→        tm = int(t.get("tm", 0))
+   137→        ts = int(t.get("ts", 0))
+   138→        qt = t.get("qTime", 10)
+   139→        elapsed = (q - 1) * qt * 60 + (qt * 60 - tm * 60 - ts)
+   140→        return max(0, min(elapsed, 2400))
+   141→    except (ValueError, TypeError):
+   142→        return 0
+   143→
+   144→
+   145→def get_scores(game):
+   146→    try:
+   147→        p = game.get("scores", "0-0").split("-")
+   148→        return int(p[0]), int(p[1])
+   149→    except (ValueError, IndexError, AttributeError):
+   150→        return 0, 0
+   151→
+   152→
+   153→def fmt_time(game):
+   154→    t = game.get("time", {})
+   155→    return f"Q{t.get('q','?')} {t.get('tm','0')}:{str(t.get('ts','0')).zfill(2)}"
+   156→
+   157→
+   158→def fmt_num(v):
+   159→    if v is None: return "N/A"
+   160→    if isinstance(v, float) and v == int(v): return str(int(v))
+   161→    return str(v)
+   162→
+   163→
+   164→# ─── PREDICTION ENGINE ────────────────────────────────────────────────────────
+   165→def predict_moneyline(markets):
+   166→    ml = markets.get("1X2")
+   167→    if not ml or not ml["opening"] or not ml["latest"]:
+   168→        return None
+   169→    op, cur = ml["opening"], ml["latest"]
+   170→    op_h, op_a = op.get("row1"), op.get("row3")
+   171→    cur_h, cur_a = cur.get("row1"), cur.get("row3")
+   172→    if not all([op_h, op_a, cur_h, cur_a]):
+   173→        return None
+   174→    if cur_h < 1.05 or cur_a < 1.05:
+   175→        return None
+   176→
+   177→    op_hp, op_ap = implied_prob(op_h), implied_prob(op_a)
+   178→    cur_hp, cur_ap = implied_prob(cur_h), implied_prob(cur_a)
+   179→    h_shift = cur_hp - op_hp
+   180→    a_shift = cur_ap - op_ap
+   181→
+   182→    if abs(h_shift) < 0.03 and abs(a_shift) < 0.03:
+   183→        return None
+   184→
+   185→    if h_shift > a_shift:
+   186→        pick, shift_pct = "HOME", h_shift * 100
+   187→    else:
+   188→        pick, shift_pct = "AWAY", a_shift * 100
+   189→
+   190→    raw_conf = min(95, 30 + abs(shift_pct) * 2.5)
+   191→
+   192→    # Cross-validate with Handicap rating
+   193→    rating_boost = 0
+   194→    hc = markets.get("Handicap")
+   195→    if hc and hc["latest"]:
+   196→        for r in hc["latest"].get("rating", []):
+   197→            if r and isinstance(r, dict):
+   198→                rd = r.get("direction", "")
+   199→                rv = abs(r.get("rating", 0))
+   200→                if (pick == "HOME" and rd == "Home") or (pick == "AWAY" and rd == "Away"):
+   201→                    rating_boost = min(10, rv * 2)
+   202→                    break
+   203→
+   204→    # Also cross-validate with HT 1X2 direction
+   205→    ht_ml = markets.get("HT 1X2")
+   206→    if ht_ml and ht_ml["latest"]:
+   207→        ht_op, ht_cur = ht_ml["opening"], ht_ml["latest"]
+   208→        ht_op_h, ht_op_a = ht_op.get("row1"), ht_op.get("row3")
+   209→        ht_cur_h, ht_cur_a = ht_cur.get("row1"), ht_cur.get("row3")
+   210→        if all([ht_op_h, ht_op_a, ht_cur_h, ht_cur_a]):
+   211→            ht_h_shift = implied_prob(ht_cur_h) - implied_prob(ht_op_h)
+   212→            ht_a_shift = implied_prob(ht_cur_a) - implied_prob(ht_op_a)
+   213→            ht_pick = "HOME" if ht_h_shift > ht_a_shift else "AWAY"
+   214→            if ht_pick == pick:
+   215→                rating_boost = min(rating_boost + 5, 12)
+   216→
+   217→    confidence = min(98, raw_conf + rating_boost)
+   218→    details = {
+   219→        "op_home": op_h, "op_away": op_a,
+   220→        "cur_home": cur_h, "cur_away": cur_a,
+   221→        "home_shift": round(h_shift * 100, 1),
+   222→        "away_shift": round(a_shift * 100, 1),
+   223→        "rating_boost": round(rating_boost, 1),
+   224→    }
+   225→    return (pick, round(confidence, 1), details)
+   226→
+   227→
+   228→def predict_total(markets, game):
+   229→    tot = markets.get("Total")
+   230→    if not tot or not tot["opening"] or not tot["latest"]:
+   231→        return None
+   232→    op, cur = tot["opening"], tot["latest"]
+   233→    op_line, cur_line = op.get("row2"), cur.get("row2")
+   234→    cur_over, cur_under = cur.get("row1"), cur.get("row3")
+   235→    if not all([op_line, cur_line, cur_over, cur_under]):
+   236→        return None
+   237→
+   238→    line_move = cur_line - op_line
+   239→    hs, as_ = get_scores(game)
+   240→    total_score = hs + as_
+   241→    elapsed = get_elapsed_sec(game)
+   242→    full_time = tot.get("full_time", 2400)
+   243→
+   244→    if elapsed < 300:
+   245→        return None
+   246→
+   247→    projected = (total_score / elapsed) * full_time
+   248→    pace_gap = projected - cur_line
+   249→
+   250→    over_prob, under_prob = implied_prob(cur_over), implied_prob(cur_under)
+   251→
+   252→    score_sig = 1 if pace_gap > 3 else (-1 if pace_gap < -3 else 0)
+   253→    line_sig = -1 if line_move < -2 else (1 if line_move > 2 else 0)
+   254→    odds_sig = 1 if over_prob > under_prob else -1
+   255→    combined = score_sig * 3 + line_sig * 2 + odds_sig * 1
+   256→
+   257→    if combined == 0:
+   258→        return None
+   259→
+   260→    pick = "OVER" if combined > 0 else "UNDER"
+   261→
+   262→    raw_conf = 35
+   263→    raw_conf += min(25, abs(pace_gap) * 2)
+   264→    raw_conf += min(20, abs(line_move) * 3)
+   265→    raw_conf += min(10, abs(combined) * 3)
+   266→
+   267→    rating_boost = 0
+   268→    for r in cur.get("rating", []):
+   269→        if r and isinstance(r, dict):
+   270→            rd = r.get("direction", "")
+   271→            if (pick == "OVER" and rd == "Over") or (pick == "UNDER" and rd == "Under"):
+   272→                rating_boost = min(10, abs(r.get("rating", 0)) * 3)
+   273→                break
+   274→            else:
+   275→                rating_boost = -5
+   276→
+   277→    # Cross-validate with HT Total direction
+   278→    ht_tot = markets.get("HT Total")
+   279→    if ht_tot and ht_tot["latest"]:
+   280→        ht_op_line = ht_tot["opening"].get("row2") if ht_tot["opening"] else None
+   281→        ht_cur_line = ht_tot["latest"].get("row2")
+   282→        if ht_op_line and ht_cur_line:
+   283→            ht_line_move = ht_cur_line - ht_op_line
+   284→            if (pick == "OVER" and ht_line_move > 1) or (pick == "UNDER" and ht_line_move < -1):
+   285→                rating_boost = min(rating_boost + 4, 12)
+   286→
+   287→    confidence = max(30, min(95, raw_conf + rating_boost))
+   288→    details = {
+   289→        "op_line": op_line, "cur_line": cur_line,
+   290→        "line_move": round(line_move, 1),
+   291→        "current_score": total_score,
+   292→        "elapsed_min": round(elapsed / 60, 1),
+   293→        "projected_total": round(projected, 1),
+   294→        "pace_gap": round(pace_gap, 1),
+   295→        "cur_over_odds": cur_over, "cur_under_odds": cur_under,
+   296→        "rating_boost": rating_boost,
+   297→    }
+   298→    return (pick, round(confidence, 1), cur_line, details)
+   299→
+   300→
+   301→def analyze_game(game, odds_data):
+   302→    markets = parse_markets(odds_data)
+   303→    preds = []
+   304→    if get_quarter(game) < 2:
+   305→        return preds
+   306→
+   307→    ml = predict_moneyline(markets)
+   308→    if ml:
+   309→        pick, conf, details = ml
+   310→        if conf >= CONFIDENCE_THRESHOLD:
+   311→            preds.append({"type": "MONEYLINE", "pick": pick, "confidence": conf, "details": details})
+   312→
+   313→    tot = predict_total(markets, game)
+   314→    if tot:
+   315→        pick, conf, line, details = tot
+   316→        if conf >= CONFIDENCE_THRESHOLD:
+   317→            preds.append({"type": "TOTAL", "pick": pick, "line": line, "confidence": conf, "details": details})
+   318→
+   319→    preds.sort(key=lambda x: x["confidence"], reverse=True)
+   320→    return preds, markets
+   321→
+   322→
+   323→# ─── MESSAGE FORMATTING ───────────────────────────────────────────────────────
+   324→def fmt_pred(game, pred, rank=1):
+   325→    home = game["home"]["name"]
+   326→    away = game["away"]["name"]
+   327→    league = game["league"]["name"]
+   328→    icon = "\U0001f525" if rank == 1 else "\u26a1"
+   329→    lines = [
+   330→        f"{icon} #{rank} {pred['type']}",
+   331→        f"{home} vs {away}",
+   332→        f"{league} | {fmt_time(game)} | {game.get('scores', '0-0')}",
+   333→        f"Confidence: {pred['confidence']}%",
+   334→        "-" * 30,
+   335→    ]
+   336→    d = pred["details"]
+   337→    if pred["type"] == "MONEYLINE":
+   338→        lines.append(f"Pick: <b>{pred['pick']}</b>")
+   339→        lines.append(f"Opening: H {d['op_home']} / A {d['op_away']}")
+   340→        lines.append(f"Current: H {d['cur_home']} / A {d['cur_away']}")
+   341→        hs = f"+{d['home_shift']}%" if d['home_shift'] > 0 else f"{d['home_shift']}%"
+   342→        as_ = f"+{d['away_shift']}%" if d['away_shift'] > 0 else f"{d['away_shift']}%"
+   343→        lines.append(f"Shift: Home {hs} | Away {as_}")
+   344→        rb = round(d['rating_boost'], 1)
+   345→        if rb > 0:
+   346→            lines.append(f"Rating confirm: +{rb}%")
+   347→    else:
+   348→        lines.append(f"Pick: <b>{pred['pick']} {pred['line']}</b>")
+   349→        lines.append(f"Line: {d['op_line']} -> {d['cur_line']} ({d['line_move']:+.1f})")
+   350→        lines.append(f"Score: {d['current_score']}pts in {d['elapsed_min']}min")
+   351→        lines.append(f"Pace: {d['projected_total']}pts (gap {d['pace_gap']:+.1f})")
+   352→        lines.append(f"Odds: Over {d['cur_over_odds']} / Under {d['cur_under_odds']}")
+   353→        rb = round(d['rating_boost'], 1)
+   354→        if rb > 0:
+   355→            lines.append(f"Rating confirm: +{rb}%")
+   356→        elif rb < 0:
+   357→            lines.append(f"Rating disagree: {rb}%")
+   358→    return "\n".join(lines)
+   359→
+   360→
+   361→def fmt_all(results):
+   362→    if not results:
+   363→        return "No high-confidence predictions found.\nGames may be too early (need Q2+) or odds haven't moved enough."
+   364→    lines = [f"\U0001f525 <b>LIVE PREDICTIONS</b> ({len(results)} picks)", ""]
+   365→    for i, (g, p) in enumerate(results):
+   366→        lines.append(fmt_pred(g, p, rank=i + 1))
+   367→        lines.append("")
+   368→    return "\n".join(lines)
+   369→
+   370→
+   371→def fmt_detail(game, markets, preds):
+   372→    home = game["home"]["name"]
+   373→    away = game["away"]["name"]
+   374→    lines = [
+   375→        f"\U0001f3c0 <b>{home} vs {away}</b>",
+   376→        f"{game['league']['name']} | {fmt_time(game)} | Score: {game.get('scores', '0-0')}",
+   377→        "",
+   378→    ]
+   379→    for mname in ["1X2", "Handicap", "Total", "HT 1X2", "HT Handicap", "HT Total"]:
+   380→        m = markets.get(mname)
+   381→        if not m:
+   382→            lines.append(f"<b>{mname}</b>: No data")
+   383→            continue
+   384→        op, cur, rows = m["opening"], m["latest"], m["rows"]
+   385→        if not op or not cur:
+   386→            lines.append(f"<b>{mname}</b>: Partial data")
+   387→            continue
+   388→        lines.append(f"<b>{mname}</b> ({m['inplay_count']} updates)")
+   389→        parts = []
+   390→        for i, rn in enumerate(rows):
+   391→            ov, cv = op.get(f"row{i+1}"), cur.get(f"row{i+1}")
+   392→            if ov is not None and cv is not None:
+   393→                parts.append(f"{rn}: {fmt_num(ov)}->{fmt_num(cv)}")
+   394→        lines.append("  " + " | ".join(parts))
+   395→        for r in cur.get("rating", []):
+   396→            if r and isinstance(r, dict):
+   397→                lines.append(f"  Rating: {r.get('direction', '?')} ({r.get('rating', 0):.2f})")
+   398→        lines.append("")
+   399→    if preds:
+   400→        lines.append("\U0001f4ca <b>PREDICTIONS</b>")
+   401→        for p in preds:
+   402→            if p["type"] == "MONEYLINE":
+   403→                lines.append(f"  {p['pick']} MONEYLINE ({p['confidence']}%)")
+   404→            else:
+   405→                lines.append(f"  {p['pick']} {p['line']} ({p['confidence']}%)")
+   406→    else:
+   407→        lines.append("\U0001f4ca No confident prediction (need Q2+)")
+   408→    return "\n".join(lines)
+   409→
+   410→
+   411→# ─── SCAN ENGINE ──────────────────────────────────────────────────────────────
+   412→def scan_and_predict():
+   413→    global scan_count, pred_count
+   414→    games = fetch_live_games()
+   415→    if not games:
+   416→        return None, None, [], games
+   417→    scan_count += 1
+   418→    eligible = [g for g in games if get_quarter(g) >= 2]
+   419→    if not eligible:
+   420→        return None, None, [], games
+   421→
+   422→    results = []
+   423→    debug_lines = []
+   424→    for g in eligible:
+   425→        try:
+   426→            odds = fetch_odds(g["id"])
+   427→            if not odds:
+   428→                debug_lines.append(f"{g['id']}: odds=EMPTY")
+   429→                continue
+   430→            preds, markets = analyze_game(g, odds)
+   431→            n_markets = len(markets)
+   432→            debug_lines.append(f"{g['id']}: markets={n_markets} preds={len(preds)}")
+   433→            for p in preds:
+   434→                results.append((g, p))
+   435→                pred_count += 1
+   436→        except Exception as e:
+   437→            debug_lines.append(f"{g['id']}: ERROR {e}")
+   438→    # Store debug info for the worker
+   439→    scan_and_predict.debug = debug_lines
+   440→
+   441→    results.sort(key=lambda x: x[1]["confidence"], reverse=True)
+   442→    if results:
+   443→        return results[0][0], results[0][1], results, games
+   444→    return None, None, [], games
+   445→
+   446→
+   447→# ─── AUTO-SCAN BACKGROUND WORKER ─────────────────────────────────────────
+   448→def auto_scan_worker():
+   449→    """Fully automatic background scanner. Runs forever, pushes predictions."""
+   450→    global auto_tracking, known_games
+   451→    auto_tracking = True
+   452→    cycle = 0
+   453→
+   454→    while auto_tracking:
+   455→        cycle += 1
+   456→        try:
+   457→            bg, bp, all_results, games = scan_and_predict()
+   458→
+   459→            # --- New game alerts: notify when games enter Q2 ---
+   460→            if games and NEW_GAME_ALERT:
+   461→                current_ids = {g["id"] for g in games if get_quarter(g) >= 2}
+   462→                new_ids = current_ids - known_games
+   463→                if new_ids:
+   464→                    new_games = [g for g in games if g["id"] in new_ids]
+   465→                    for ng in new_games[:5]:
+   466→                        bot.send_message(CHAT_ID,
+   467→                            f"\U0001f3c0 <b>New game entered Q2+</b>\n"
+   468→                            f"{ng['home']['name']} vs {ng['away']['name']}\n"
+   469→                            f"{ng['league']['name']} | {ng.get('scores', '0-0')}\n"
+   470→                            f"\U0001f4c5 ID: <code>{ng['id']}</code>",
+   471→                            parse_mode="HTML"
+   472→                        )
+   473→                known_games = current_ids
+   474→
+   475→            # --- Send predictions ---
+   476→            dbg = getattr(scan_and_predict, 'debug', [])
+   477→            if cycle <= 3 or not bg:
+   478→                # First 3 cycles or any failure: send diagnostic to Telegram
+   479→                diag = f"\U0001f50d Cycle {cycle}\n"
+   480→                diag += f"Games: {len(games)} | Eligible: {len([g for g in games if get_quarter(g) >= 2])}\n"
+   481→                diag += f"Predictions found: {len(all_results)}\n"
+   482→                if dbg:
+   483→                    diag += "\n" + "\n".join(dbg)
+   484→                if all_results:
+   485→                    diag += f"\n\nBest: {all_results[0][1]['type']} {all_results[0][1]['pick']} {all_results[0][1]['confidence']}%"
+   486→                bot.send_message(CHAT_ID, diag, parse_mode="HTML")
+   487→
+   488→            if bg and bp:
+   489→                if ALL_PREDICTIONS and all_results:
+   490→                    for g, p in all_results:
+   491→                        key = f"{g['id']}_{p['type']}"
+   492→                        old = last_predictions.get(key, 0)
+   493→                        new_conf = p["confidence"]
+   494→                        if abs(new_conf - old) >= 5:
+   495→                            rank = 1 if (g, p) == (bg, bp) else 2
+   496→                            bot.send_message(CHAT_ID, fmt_pred(g, p, rank=rank), parse_mode="HTML")
+   497→                            last_predictions[key] = new_conf
+   498→                else:
+   499→                    key = f"{bg['id']}_{bp['type']}"
+   500→                    old = last_predictions.get(key, 0)
+   501→                    new_conf = bp["confidence"]
+   502→                    if abs(new_conf - old) >= 5:
+   503→                        bot.send_message(CHAT_ID, fmt_pred(bg, bp, rank=1), parse_mode="HTML")
+   504→                        last_predictions[key] = new_conf
+   505→
+   506→            # Periodic status every 10 cycles (10 min)
+   507→            if cycle % 10 == 0 and games:
+   508→                eligible = len([g for g in games if get_quarter(g) >= 2])
+   509→                bot.send_message(CHAT_ID,
+   510→                    f"\U0001f4ca Scan #{scan_count} | {len(games)} live | {eligible} analyzing | {pred_count} predictions sent",
+   511→                    parse_mode="HTML"
+   512→                )
+   513→
+   514→        except Exception as e:
+   515→            bot.send_message(CHAT_ID, f"\u274c Cycle {cycle} crashed: {e}", parse_mode="HTML")
+   516→
+   517→        # Sleep in 1-second increments for instant stop capability
+   518→        for _ in range(SCAN_INTERVAL):
+   519→            if not auto_tracking:
+   520→                break
+   521→            time.sleep(1)
+   522→
+   523→
+   524→def start_auto_scan():
+   525→    """Start the auto-scan background thread (called once at boot)."""
+   526→    global scan_thread, auto_tracking
+   527→    if auto_tracking:
+   528→        return
+   529→    auto_tracking = True
+   530→    scan_thread = threading.Thread(target=auto_scan_worker, daemon=True)
+   531→    scan_thread.start()
+   532→
+   533→
+   534→# ─── TELEGRAM HANDLERS ────────────────────────────────────────────────────────
+   535→@bot.message_handler(commands=["start"])
+   536→def cmd_start(msg):
+   537→    bot.reply_to(msg,
+   538→        "\U0001f3c0 <b>Basketball Prediction Bot</b>\n"
+   539→        "\u26a1 <b>Fully automatic</b> - predictions auto-sent!\n\n"
+   540→        "Optional commands:\n"
+   541→        "/scan all - All predictions now\n"
+   542→        "/stop - Pause\n"
+   543→        "/track - Resume\n"
+   544→        "/status - Stats\n"
+   545→        "/live - Live games list",
+   546→        parse_mode="HTML"
+   547→    )
+   548→
+   549→
+   550→@bot.message_handler(commands=["help"])
+   551→def cmd_help(msg):
+   552→    bot.reply_to(msg,
+   553→        "<b>Commands:</b>\n"
+   554→        "/scan - Find best prediction\n"
+   555→        "/scan all - All predictions\n"
+   556→        "/game &lt;event_id&gt; - Detailed odds\n"
+   557→        "/track - Auto-scan every 60s\n"
+   558→        "/stop - Stop auto-scan\n"
+   559→        "/status - Bot status & stats\n\n"
+   560→        "<b>Prediction types:</b>\n"
+   561→        "- MONEYLINE (Home/Away)\n"
+   562→        "- TOTAL Over/Under\n\n"
+   563→        "<b>How it works:</b>\n"
+   564→        "Compares opening odds vs live in-play odds.\n"
+   565→        "Finds the game with the biggest odds movement\n"
+   566→        "and highest confidence signal.\n\n"
+   567→        "<b>Confidence factors:</b>\n"
+   568→        "- Odds drift magnitude (40%)\n"
+   569→        "- Scoring pace vs total line (25%)\n"
+   570→        "- API rating agreement (20%)\n"
+   571→        "- Cross-market confirmation (15%)",
+   572→        parse_mode="HTML"
+   573→    )
+   574→
+   575→
+   576→@bot.message_handler(commands=["scan"])
+   577→def cmd_scan(msg):
+   578→    send_all = "all" in msg.text.lower()
+   579→    bot.reply_to(msg, "\u23f3 Scanning live games...", parse_mode="HTML")
+   580→    bg, bp, all_r, _ = scan_and_predict()
+   581→    if send_all:
+   582→        text = fmt_all(all_r)
+   583→    else:
+   584→        if bg and bp:
+   585→            text = fmt_pred(bg, bp, rank=1)
+   586→        else:
+   587→            text = "No high-confidence predictions found.\nTry /scan all or wait for games to reach Q2+."
+   588→    bot.send_message(CHAT_ID, text, parse_mode="HTML")
+   589→
+   590→
+   591→@bot.message_handler(commands=["game"])
+   592→def cmd_game(msg):
+   593→    parts = msg.text.split()
+   594→    if len(parts) < 2:
+   595→        bot.reply_to(msg, "Usage: /game &lt;event_id&gt;\nExample: /game 12466117", parse_mode="HTML")
+   596→        return
+   597→    eid = parts[1]
+   598→    bot.reply_to(msg, f"\u23f3 Fetching odds for game {eid}...", parse_mode="HTML")
+   599→    odds = fetch_odds(eid)
+   600→    if not odds:
+   601→        bot.reply_to(msg, f"No odds data for game {eid}. Check the ID and try again.", parse_mode="HTML")
+   602→        return
+   603→    markets = parse_markets(odds)
+   604→    # Build a minimal game dict from first market's latest entry
+   605→    sample = None
+   606→    for m in odds:
+   607→        if m.get("odds"):
+   608→            inplay = [o for o in m["odds"] if o.get("game_time") != ""]
+   609→            if inplay:
+   610→                s = inplay[0].get("ss", [0, 0])
+   611→                gt = inplay[0].get("game_time", "")
+   612→                sample = {
+   613→                    "home": {"name": "Home"}, "away": {"name": "Away"},
+   614→                    "league": {"name": "N/A"},
+   615→                    "scores": f"{s[0] if s[0] else '?'}-{s[1] if s[1] else '?'}",
+   616→                    "time": {"q": gt.split(" - ")[0].replace("Q","").strip() if " - " in gt else "?",
+   617→                             "tm": "0", "ts": "0"},
+   618→                }
+   619→                break
+   620→    if not sample:
+   621→        sample = {"home": {"name": "Home"}, "away": {"name": "Away"},
+   622→                 "league": {"name": "N/A"}, "scores": "?-?",
+   623→                 "time": {"q": "0", "tm": "0", "ts": "0"}}
+   624→    preds, _ = analyze_game(sample, odds)
+   625→    text = fmt_detail(sample, markets, preds)
+   626→    bot.send_message(CHAT_ID, text, parse_mode="HTML")
+   627→
+   628→
+   629→@bot.message_handler(commands=["track"])
+   630→def cmd_track(msg):
+   631→    global auto_tracking
+   632→    if auto_tracking:
+   633→        bot.reply_to(msg, "\u26a1 Auto-scan is already running!", parse_mode="HTML")
+   634→        return
+   635→    start_auto_scan()
+   636→    bot.reply_to(msg, "\u2705 Auto-scan RESUMED.", parse_mode="HTML")
+   637→
+   638→
+   639→@bot.message_handler(commands=["stop"])
+   640→def cmd_stop(msg):
+   641→    global auto_tracking
+   642→    if not auto_tracking:
+   643→        bot.reply_to(msg, "\u23f9 Already paused.", parse_mode="HTML")
+   644→        return
+   645→    auto_tracking = False
+   646→    bot.reply_to(msg, "\u23f9 Auto-scan PAUSED.\nUse /track to resume.", parse_mode="HTML")
+   647→
+   648→
+   649→@bot.message_handler(commands=["status"])
+   650→def cmd_status(msg):
+   651→    games = fetch_live_games()
+   652→    eligible = len([g for g in games if get_quarter(g) >= 2]) if games else 0
+   653→    text = (
+   654→        f"\U0001f4ca <b>Bot Status</b>\n"
+   655→        f"Live games: {len(games) if games else 0}\n"
+   656→        f"Eligible (Q2+): {eligible}\n"
+   657→        f"Total scans: {scan_count}\n"
+   658→        f"Total predictions: {pred_count}\n"
+   659→        f"Auto-track: {'ON' if auto_tracking else 'OFF'}\n"
+   660→        f"Cache size: {len(opening_cache._cache)}\n"
+   661→        f"Interval: {SCAN_INTERVAL}s\n"
+   662→        f"Confidence threshold: {CONFIDENCE_THRESHOLD}%"
+   663→    )
+   664→    bot.send_message(CHAT_ID, text, parse_mode="HTML")
+   665→
+   666→
+   667→# ─── INLINE GAME LIST (quick access) ─────────────────────────────────────────
+   668→@bot.message_handler(commands=["live"])
+   669→def cmd_live(msg):
+   670→    games = fetch_live_games()
+   671→    if not games:
+   672→        bot.reply_to(msg, "No live basketball games right now.", parse_mode="HTML")
+   673→        return
+   674→    lines = [f"\U0001f3c0 <b>Live Games ({len(games)})</b>", ""]
+   675→    for g in games[:15]:  # cap at 15 for 3G
+   676→        q = get_quarter(g)
+   677→        q_badge = f"Q{q}" if q >= 1 else ""
+   678→        lines.append(f"\u2022 <code>{g['id']}</code> {g['home']['name']} vs {g['away']['name']}  {g.get('scores', '')} {q_badge}")
+   679→    if len(games) > 15:
+   680→        lines.append(f"\n... and {len(games) - 15} more")
+   681→    lines.append("\nUse /game &lt;id&gt; for details")
+   682→    bot.send_message(CHAT_ID, "\n".join(lines), parse_mode="HTML")
+   683→
+   684→
+   685→# ─── MAIN ─────────────────────────────────────────────────────────────────────
+   686→if __name__ == "__main__":
+   687→    print("\U0001f3c0 Basketball Prediction Bot starting...")
+   688→    print(f"   Chat ID: {CHAT_ID}")
+   689→    print(f"   Scan interval: {SCAN_INTERVAL}s")
+   690→    print(f"   Confidence threshold: {CONFIDENCE_THRESHOLD}%")
+   691→    print(f"   Auto-start: {AUTO_START}")
+   692→    print(f"   3G optimized: timeout={REQUEST_TIMEOUT}s, workers={MAX_WORKERS}")
+   693→
+   694→    _VER = "v2.1"
+   695→
+   696→    # Launch message
+   697→    mode = "\U0001f525 FULLY AUTOMATIC" if AUTO_START else "manual"
+   698→    bot.send_message(CHAT_ID,
+   699→        f"\U0001f3c0 <b>Bot Online! {_VER} {mode}</b>\n"
+   700→        f"Scanning every {SCAN_INTERVAL}s. Predictions auto-sent.\n"
+   701→        f"Confidence threshold: {CONFIDENCE_THRESHOLD}%",
+   702→        parse_mode="HTML"
+   703→    )
+   704→
+   705→    # Auto-start background scanner
+   706→    if AUTO_START:
+   707→        start_auto_scan()
+   708→        print("   Auto-scan started (background)")
+   709→
+   710→    bot.polling(timeout=30, long_polling_timeout=25)
+   711→
