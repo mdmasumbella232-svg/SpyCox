@@ -421,10 +421,10 @@ def scan_and_predict():
 
     results = []
     def work(g):
+        nonlocal results
         odds = fetch_odds(g["id"])
         if not odds: return None
         preds, markets = analyze_game(g, odds)
-        if preds: pred_count += 1
         return (g, markets, preds)
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
@@ -436,7 +436,9 @@ def scan_and_predict():
                     g, markets, preds = r
                     for p in preds:
                         results.append((g, p))
-            except Exception:
+                        pred_count += 1
+            except Exception as e:
+                print(f'Worker error: {e}')
                 continue
 
     results.sort(key=lambda x: x[1]["confidence"], reverse=True)
