@@ -22,6 +22,9 @@ AUTO_START = True  # fully automatic on launch, no commands needed
 NEW_GAME_ALERT = False  # notify when new games enter Q2
 ALL_PREDICTIONS = False  # True = send all picks, False = only #1 best
 CONFIDENCE_THRESHOLD = 60
+MIN_ODDS = 1.80
+MAX_ODDS = 2.80
+MAX_QUARTER = 3  # avoid Q4+
 MAX_GAMES_IN_MEMORY = 20
 REQUEST_TIMEOUT = 8
 MAX_WORKERS = 3
@@ -313,20 +316,27 @@ def predict_total(markets, game):
 def analyze_game(game, odds_data):
     markets = parse_markets(odds_data)
     preds = []
-    if get_quarter(game) < 2:
-        return preds
+    q = get_quarter(game)
+    if q < 2 or q > MAX_QUARTER:
+        return preds, markets
 
     ml = predict_moneyline(markets)
     if ml:
         pick, conf, details = ml
         if conf >= CONFIDENCE_THRESHOLD:
-            preds.append({"type": "MONEYLINE", "pick": pick, "confidence": conf, "details": details})
+            # Filter by odds range
+            pick_odds = details['cur_away'] if pick == "AWAY" else details['cur_home']
+            if MIN_ODDS <= pick_odds <= MAX_ODDS:
+                preds.append({"type": "MONEYLINE", "pick": pick, "confidence": conf, "details": details})
 
     tot = predict_total(markets, game)
     if tot:
         pick, conf, line, details = tot
         if conf >= CONFIDENCE_THRESHOLD:
-            preds.append({"type": "TOTAL", "pick": pick, "line": line, "confidence": conf, "details": details})
+            # Filter by odds range
+            pick_odds = details['cur_under_odds'] if pick == "UNDER" else details['cur_over_odds']
+            if MIN_ODDS <= pick_odds <= MAX_ODDS:
+                preds.append({"type": "TOTAL", "pick": pick, "line": line, "confidence": conf, "details": details})
 
     preds.sort(key=lambda x: x["confidence"], reverse=True)
     return preds, markets
